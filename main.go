@@ -13,10 +13,12 @@ package main
  
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -481,9 +483,82 @@ func rejectConn(c net.Conn, msg string) {
 	c.Close()
 }
  
+// The program's own source, embedded so the host can hand it out over HTTP.
+//
+//go:embed main.go
+var sourceCode string
+ 
+const goModSource = "module invaders\n\ngo 1.20\n"
+ 
+func writeHTTP(c net.Conn, status, body string, headOnly bool) {
+	hdr := fmt.Sprintf("HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"+
+		"Content-Length: %d\r\nConnection: close\r\n\r\n", status, len(body))
+	c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	c.Write([]byte(hdr))
+	if !headOnly {
+		c.Write([]byte(body))
+	}
+}
+ 
+// serveHTTP answers a plain HTTP request that arrived on the game port.
+func serveHTTP(c net.Conn, br *bufio.Reader) {
+	defer c.Close()
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		return
+	}
+	head := req.Method == http.MethodHead
+	host := req.Host
+	if host == "" {
+		host = c.LocalAddr().String()
+	}
+	switch req.URL.Path {
+	case "/":
+		writeHTTP(c, "200 OK", fmt.Sprintf(`TERMINAL SPACE INVADERS (multiplayer)
+=======================================
+ 
+You were invited to a game. To play you need Go 1.20+ (https://go.dev/dl/)
+and a terminal of at least 80x24 (macOS / Linux / WSL).
+ 
+1. Download the game:
+ 
+     mkdir invaders && cd invaders
+     curl -O http://%[1]s/main.go
+     curl -O http://%[1]s/go.mod
+ 
+2. Run it:
+ 
+     go run .
+ 
+3. Choose "2) Join a game", then enter:
+ 
+     Host address: %[1]s
+     Your name:    (anything you like)
+ 
+Controls: Left/Right or A/D = move, Space = fire, Q = quit.
+Wait in the lobby until the host presses ENTER.
+`, host), head)
+	case "/main.go":
+		writeHTTP(c, "200 OK", sourceCode, head)
+	case "/go.mod":
+		writeHTTP(c, "200 OK", goModSource, head)
+	default:
+		writeHTTP(c, "404 Not Found", "Not found. Try / for instructions.\n", head)
+	}
+}
+ 
 func (g *game) handleConn(c net.Conn) {
-	dec := json.NewDecoder(c)
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	br := bufio.NewReader(c)
+	// Game clients start with a JSON object; web clients start with "GET ".
+	if first, err := br.Peek(4); err != nil {
+		c.Close()
+		return
+	} else if m := string(first); m == "GET " || m == "HEAD" {
+		serveHTTP(c, br)
+		return
+	}
+	dec := json.NewDecoder(br)
 	var hello ClientMsg
 	if err := dec.Decode(&hello); err != nil || hello.Type != "hello" {
 		c.Close()
